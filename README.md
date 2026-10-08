@@ -2,19 +2,20 @@
 
 **Systems Assurance Forensic Investigation & Design** · *Identity · Transparency · Integrity*
 
-Everything Priority Nexus LLC adds, edits, corrects, reviews, deletes or publishes, across all its projects, in
-one append-only record. We have nothing to hide from our mistakes: corrections and deletions are listed by name
-every month.
+Everything Priority Nexus LLC adds, edits, corrects, reviews, deletes or publishes. **Every project keeps its own
+append-only ledger** (`LEDGER.md` in its repository), and on the 1st of each month this repository publishes one
+report that rolls them all up. We have nothing to hide from our mistakes: corrections, deletions and publications
+are listed by name.
 
-- **[LEDGER.md](LEDGER.md):** every entry, oldest first. One row each: date · action · project · what ·
-  fingerprint · note · chain.
-- **[STATS](STATS):** a one-page summary for each month, published on the 1st: counts per action, every
-  correction and deletion by name, and whether the chain is intact.
+- **Project ledgers:** `LEDGER.md` in each project repository (links below and in every report).
+- **[LEDGER.md](LEDGER.md):** company-wide entries (and the combined record kept before 2026-10-08).
+- **[STATS](STATS):** the monthly report, published on the 1st: counts per action for all projects, each project's
+  corrections, deletions and publications by name, and a chain check for every ledger.
 
 ## How it stays honest
 - **Only added to.** A mistake is fixed by a new *Corrected* row, never by changing an old one.
 - **Chained.** Each row's chain value is built from the row before it. Change or remove any past row and every
-  later value breaks. Check it yourself: `python ledger.py verify` (Python 3, nothing to install).
+  later value breaks. Check any ledger yourself: `python ledger.py verify LEDGER.md` (Python 3, nothing to install).
 - **History locked.** This repository refuses rewrites of its history, including from its owner.
 - **Fingerprints.** Each row carries a fingerprint (SHA-256) of the file, commit or report it refers to.
 - **Fair to others.** Reports not yet published are listed without their subject, so no one is named before they've

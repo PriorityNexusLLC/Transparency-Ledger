@@ -40,3 +40,4 @@
 | 2026-10-08 | Reviewed | PNMaster-Graph | Report (unpublished): independent second check | db67194768f9 | VERIFIED; sources 346/346 confirmed | d7c98fbfb44c3118 |
 | 2026-10-08 | Reviewed | PNMaster-Graph | Report (unpublished): independent second check | f3d5489032ae | VERIFIED; sources 319/319 confirmed | 76c5cfef3806fad8 |
 | 2026-10-08 | Corrected | PNMaster-Graph | Senate claims check: three people missed because of name forms (maiden name, Pat/Patrick, Bill/William) | a7648b3197ea | Name matching fixed; all three now confirmed from filings | b7f2c23c9f496e6f |
+| 2026-10-08 | Edited | Transparency-Ledger | Ledger structure: from 2026-10-08 each project keeps its own ledger in its own repository; this ledger continues for company-wide entries and the monthly reports roll all project l | 066e10e31d7b | Rows above were recorded before the change and are kept as they are | d26e86e47913a1d4 |

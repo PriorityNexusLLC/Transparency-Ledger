@@ -1,60 +1,106 @@
-"""Priority Nexus Transparency Ledger: an append-only public record of what was done, and when.
+"""Priority Nexus Transparency Ledger.
 
-LEDGER.md holds one row per entry:  date | action | project | what | fingerprint | note | chain
-  action       one of: Added, Edited, Corrected, Reviewed, Deleted, Published
-  fingerprint  SHA-256 (first 12 characters) of the file or item the entry is about, or a commit id
-  chain        SHA-256 (first 16) of the previous row's chain + this row, so changing or removing any past row
-               breaks every chain value after it
+Every project repository keeps its OWN append-only ledger (LEDGER.md in that repo). This repository holds the tool,
+the company-wide ledger, and the MONTHLY REPORT that rolls all project ledgers up.
 
-Commands (Python 3 standard library only):
-  python ledger.py add ACTION "WHAT" [--project P] [--file PATH] [--note TEXT]
-  python ledger.py sync-git              add an entry for each new commit in the Priority Nexus GitHub repos
-  python ledger.py sync-reports FOLDER   add a Reviewed entry for each report that passed the independent review
-  python ledger.py verify                re-check every chain value; names the first broken row
-  python ledger.py stats [YYYY-MM]       write the monthly summary to STATS/YYYY-MM.md
-Rows are only ever appended. Mistakes are fixed by adding a Corrected row, never by editing an old one.
+A ledger row:  | date | action | what | fingerprint | note | chain |
+  action       Added, Edited, Corrected, Reviewed, Deleted, Published
+  fingerprint  first 12 characters of the SHA-256 of the file, commit or report the row is about
+  chain        first 16 characters of SHA-256(previous row's chain + this row): changing or removing any past
+               row breaks every later chain value
+Rows are only ever appended. A mistake is fixed by a new Corrected row, never by editing an old one.
+
+Commands (Python 3, standard library only):
+  python ledger.py verify LEDGER.md [more ledgers...]      check every chain value; names the first broken row
+  python ledger.py add LEDGER.md ACTION "WHAT" [--file PATH] [--note TEXT]
+  python ledger.py monthly                                 the 1st-of-the-month run (see below)
+  python ledger.py report YYYY-MM                          write the monthly report from all project ledgers
+
+monthly: for every Priority Nexus repository, record its new commits (and, for PNMaster-Graph, reviewed reports) in
+that repository's own LEDGER.md and upload once; then write last month's report here and upload once.
 """
 import argparse
 import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.request
 from collections import Counter
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LEDGER = os.path.join(HERE, "LEDGER.md")
-STATS = os.path.join(HERE, "STATS")
-ACTIONS = ["Added", "Edited", "Corrected", "Reviewed", "Deleted", "Published"]
 OWNER = "PriorityNexusLLC"
-HEADER = ("# Transparency Ledger\n\n"
-          "Everything Priority Nexus LLC adds, edits, corrects, reviews, deletes or publishes, in order. Rows are only "
-          "ever added; a mistake is fixed by a new **Corrected** row, never by changing an old one. Each row's *chain* "
-          "value is built from the row before it, so any change to history shows: run `python ledger.py verify`.\n\n"
-          "| Date | Action | Project | What | Fingerprint | Note | Chain |\n"
-          "|---|---|---|---|---|---|---|\n")
-ROW = re.compile(r"^\| (\d{4}-\d{2}-\d{2}) \| (\w+) \| (.*?) \| (.*?) \| (.*?) \| (.*?) \| ([0-9a-f]{16}) \|$")
+CENTRAL = os.path.basename(HERE)                            # this repository (the company-wide ledger + reports)
+WORK = os.path.join(os.path.dirname(HERE), "PriorityNexus-repos")   # local copies of the project repositories
+REPORTS_DIR = os.path.join(os.path.expanduser("~"), "PriorityNexus", "data", "reports")
+GIT = r"C:\Program Files\Git\cmd\git.exe" if os.name == "nt" else "git"
+ACTIONS = ["Added", "Edited", "Corrected", "Reviewed", "Deleted", "Published"]
+LEDGER_COMMIT = "Ledger:"                                   # the ledger's own uploads are never recorded as work
+ROW = re.compile(r"^\| (\d{4}-\d{2}-\d{2}) \| (\w+) \| (?:(.*?) \| )?(.*?) \| (.*?) \| (.*?) \| ([0-9a-f]{16}) \|$")
+
+
+def header(project):
+    return (f"# Ledger: {project}\n\n"
+            "Append-only record of what was added, edited, corrected, reviewed, deleted or published in this project. "
+            "Rows are only ever added; each row's chain value is built from the row before it, so any change to "
+            f"history shows. Verify with [`ledger.py`](https://github.com/{OWNER}/{CENTRAL}): "
+            "`python ledger.py verify LEDGER.md`. Monthly reports for all projects: "
+            f"[{OWNER}/{CENTRAL}](https://github.com/{OWNER}/{CENTRAL}/tree/main/STATS).\n\n"
+            "| Date | Action | What | Fingerprint | Note | Chain |\n|---|---|---|---|---|---|\n")
 
 
 def clean(s):
     return re.sub(r"\s+", " ", str(s or "")).replace("|", "/").strip()[:180]
 
 
-def rows():
-    if not os.path.exists(LEDGER):
-        return []
+def rows(path):
+    """(date, action, what, fingerprint, note, chain); also reads the older 7-column rows (with a project column)."""
     out = []
-    for line in open(LEDGER, encoding="utf-8"):
-        m = ROW.match(line.rstrip("\n"))
-        if m:
-            out.append(m.groups())
+    if os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            m = ROW.match(line.rstrip("\n"))
+            if m:
+                d, a, proj, what, fp, note, c = m.groups()
+                out.append((d, a, proj, what, fp, note, c))
     return out
+
+
+def _fields(r):
+    return [x for x in (r[0], r[1], r[2], r[3], r[4], r[5]) if x is not None]
 
 
 def chain_of(prev, fields):
     return hashlib.sha256((prev + "|" + "|".join(fields)).encode("utf-8")).hexdigest()[:16]
+
+
+def append(path, project, day, action, what, fp, note):
+    if action not in ACTIONS:
+        sys.exit(f"action must be one of {', '.join(ACTIONS)}")
+    existing = rows(path)
+    prev = existing[-1][6] if existing else "0" * 16
+    fields = [day, action] + ([clean(project)] if existing and existing[-1][2] is not None else []) + \
+             [clean(what), clean(fp), clean(note)]          # keep a ledger's original column layout
+    c = chain_of(prev, fields)
+    if not existing and (not os.path.exists(path) or not open(path, encoding="utf-8").read().strip()):
+        open(path, "w", encoding="utf-8", newline="\n").write(header(project))
+    with open(path, "a", encoding="utf-8", newline="\n") as f:
+        f.write("| " + " | ".join(fields + [c]) + " |\n")
+    return c
+
+
+def verify(path, quiet=False):
+    prev, n = "0" * 16, 0
+    for i, r in enumerate(rows(path), 1):
+        if chain_of(prev, _fields(r)) != r[6]:
+            if not quiet:
+                print(f"{path}: BROKEN at row {i} ({r[0]} {r[1]} {r[3]}): this row or one before it was changed or removed")
+            return False, i
+        prev, n = r[6], i
+    if not quiet:
+        print(f"{path}: intact, {n} rows, latest chain {prev}")
+    return True, n
 
 
 def fingerprint_file(path):
@@ -65,135 +111,186 @@ def fingerprint_file(path):
     return h.hexdigest()[:12]
 
 
-def append(day, action, project, what, fp, note):
-    if action not in ACTIONS:
-        sys.exit(f"action must be one of {', '.join(ACTIONS)}")
-    existing = rows()
-    prev = existing[-1][6] if existing else "0" * 16
-    fields = [day, action, clean(project), clean(what), clean(fp), clean(note)]
-    c = chain_of(prev, fields)
-    if not os.path.exists(LEDGER):
-        open(LEDGER, "w", encoding="utf-8", newline="\n").write(HEADER)
-    with open(LEDGER, "a", encoding="utf-8", newline="\n") as f:
-        f.write("| " + " | ".join(fields + [c]) + " |\n")
-    return c
-
-
-def verify():
-    prev, n = "0" * 16, 0
-    for i, r in enumerate(rows(), 1):
-        if chain_of(prev, list(r[:6])) != r[6]:
-            print(f"BROKEN at row {i} ({r[0]} {r[1]} {r[3]}): this row or one before it was changed or removed")
-            return 1
-        prev, n = r[6], i
-    print(f"ledger intact: {n} rows, every chain value checks out; latest chain {prev}")
-    return 0
-
-
 def api(path):
     req = urllib.request.Request("https://api.github.com/" + path, headers={"User-Agent": "PN-ledger",
                                                                           "Accept": "application/vnd.github+json"})
     return json.loads(urllib.request.urlopen(req, timeout=30).read())
 
 
-def sync_git():
-    seen = {r[4] for r in rows()}
-    new = []
-    for repo in api(f"users/{OWNER}/repos?per_page=100"):
-        commits = api(f"repos/{OWNER}/{repo['name']}/commits?per_page=100")
-        for i, c in enumerate(reversed(commits)):
-            sha = c["sha"][:12]
-            if sha in seen:
-                continue
-            day = c["commit"]["committer"]["date"][:10]
-            msg = c["commit"]["message"].splitlines()[0]
-            low = msg.lower()
-            action = "Added" if i == 0 else "Corrected" if re.search(r"\b(fix|correct|clarif|wrong|error|mistake)", low) \
-                else "Deleted" if re.search(r"\b(delete|remove)", low) else "Edited"
-            new.append((c["commit"]["committer"]["date"], day, action, repo["name"], msg, sha))
-    for _, day, action, project, msg, sha in sorted(new):
-        append(day, action, project, msg, sha, "GitHub commit")
-    print(f"sync-git: {len(new)} new entries")
+def git(repo, *a, check=True):
+    return subprocess.run([GIT, "-C", repo, *a], capture_output=True, text=True, check=check)
 
 
-def sync_reports(folder):
-    """Priority Nexus reports that went through the independent review: one Reviewed row each (titles only;
-    the review's own fingerprint is the fingerprint)."""
-    seen, n = {r[4] for r in rows()}, 0
-    items = []
-    for fn in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+def classify(msg, first):
+    low = msg.lower()
+    if first:
+        return "Added"
+    if re.search(r"\b(fix|fixed|correct|corrected|clarif\w*|wrong|error|mistake)", low):
+        return "Corrected"
+    if re.search(r"\b(delete|deleted|remove|removed)\b", low):
+        return "Deleted"
+    if re.search(r"\b(publish|published|release)\b", low):
+        return "Published"
+    return "Edited"
+
+
+def record_commits(path, project, repo_name):
+    seen = {r[4] for r in rows(path)}
+    commits = list(reversed(api(f"repos/{OWNER}/{repo_name}/commits?per_page=100")))
+    n = 0
+    for i, c in enumerate(commits):
+        msg = c["commit"]["message"].splitlines()[0]
+        if msg.startswith(LEDGER_COMMIT) or c["sha"][:12] in seen:
+            continue
+        append(path, project, c["commit"]["committer"]["date"][:10], classify(msg, i == 0), msg, c["sha"][:12], "commit")
+        n += 1
+    return n
+
+
+def record_reviews(path, project):
+    """PNMaster-Graph reports that passed the independent review. Unpublished reports are listed WITHOUT their subject,
+    so no one is named before they've had a right of reply; the fingerprint proves later which report it was."""
+    if not os.path.isdir(REPORTS_DIR):
+        return 0
+    seen, latest = {r[4] for r in rows(path)}, {}
+    for fn in sorted(os.listdir(REPORTS_DIR)):
         if not fn.endswith(".json") or fn.startswith("auto_state"):
             continue
         try:
-            sc = json.load(open(os.path.join(folder, fn), encoding="utf-8"))
+            sc = json.load(open(os.path.join(REPORTS_DIR, fn), encoding="utf-8"))
         except ValueError:
             continue
         rv = sc.get("review") or {}
-        if rv.get("state") != "done" or (rv.get("sha256") or "")[:12] in seen:
+        if rv.get("state") == "done" and rv.get("sha256"):
+            latest[(rv.get("finished_at", "")[:10], sc.get("subject"))] = rv
+    n = 0
+    for (day, _), rv in sorted(latest.items(), key=lambda kv: (kv[0][0], kv[1]["sha256"])):
+        if rv["sha256"][:12] in seen:
             continue
-        items.append((rv.get("finished_at", "")[:10], sc.get("subject_label", sc.get("report_id")), rv))
-    latest = {}                                       # one row per report subject per day (re-runs collapse)
-    for day, label, rv in sorted(items, key=lambda x: (x[0], x[2].get("finished_at", ""))):
-        latest[(day, label)] = (day, label, rv)
-    # Unpublished reports are listed WITHOUT their subject: naming who is being examined before they've had a right of
-    # reply would be unfair. The fingerprint proves later which report it was; the name appears in its Published row.
-    already = {r[4] for r in rows()}
-    items = [v for v in latest.values() if v[2]["sha256"][:12] not in already]
-    for day, label, rv in sorted(items, key=lambda v: (v[0], v[2]["sha256"])):
-        append(day or date.today().isoformat(), "Reviewed", "PNMaster-Graph", "Report (unpublished): independent second check",
-               rv["sha256"][:12], f"{rv.get('verdict', '').split(':')[0]}; sources {rv.get('sources_ok')}/{rv.get('sources')} confirmed")
+        append(path, project, day, "Reviewed", "Report (unpublished): independent second check", rv["sha256"][:12],
+               f"{rv.get('verdict', '').split(':')[0]}; sources {rv.get('sources_ok')}/{rv.get('sources')} confirmed")
         n += 1
-    print(f"sync-reports: {n} new entries")
+    return n
 
 
-def stats(month):
-    rs = [r for r in rows() if r[0].startswith(month)]
-    by_action = Counter(r[1] for r in rs)
-    by_project = Counter(r[2] for r in rs)
-    ok = verify() == 0
-    L = [f"# Ledger summary: {datetime.strptime(month, '%Y-%m').strftime('%B %Y')}", "",
-         f"**{len(rs)} entries** · chain intact: **{'yes' if ok else 'NO'}**", "",
+KNOWN_DIRS = {"PriorityNexusLLC": "PriorityNexusLLC-profile"}   # repos that already have a working copy in Documents
+
+
+def repo_dir(name):
+    """The existing working copy in Documents if there is one, else a copy under PriorityNexus-repos."""
+    d = os.path.join(os.path.dirname(HERE), KNOWN_DIRS.get(name, name))
+    return d if os.path.isdir(os.path.join(d, ".git")) else os.path.join(WORK, name)
+
+
+def local_copy(name):
+    os.makedirs(WORK, exist_ok=True)
+    d = repo_dir(name)
+    if os.path.isdir(os.path.join(d, ".git")):
+        git(d, "pull", "-q", "--ff-only")
+    else:
+        subprocess.run([GIT, "clone", "-q", f"https://github.com/{OWNER}/{name}.git", d], check=True)
+        git(d, "config", "user.name", "Priority Nexus LLC")
+        git(d, "config", "user.email", "282703525+PriorityNexusLLC@users.noreply.github.com")
+    return d
+
+
+def upload(repo_dir, message):
+    git(repo_dir, "add", "LEDGER.md", *(["STATS"] if os.path.isdir(os.path.join(repo_dir, "STATS")) else []))
+    if git(repo_dir, "diff", "--cached", "--quiet", check=False).returncode == 0:
+        return False
+    git(repo_dir, "commit", "-q", "-m", message)
+    git(repo_dir, "push", "-q")
+    return True
+
+
+def project_ledgers():
+    """(project name, path to its LEDGER.md) for every project, including this central one."""
+    out = [(CENTRAL, os.path.join(HERE, "LEDGER.md"))]
+    for r in sorted(api(f"users/{OWNER}/repos?per_page=100"), key=lambda r: r["name"].lower()):
+        if r["name"] != CENTRAL:
+            out.append((r["name"], os.path.join(repo_dir(r["name"]), "LEDGER.md")))
+    return out
+
+
+def monthly(upload_now=True):
+    last = (date.today().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    for name, path in project_ledgers()[1:]:
+        d = local_copy(name)
+        n = record_commits(path, name, name) + (record_reviews(path, name) if name == "PNMaster-Graph" else 0)
+        ok, rws = verify(path, quiet=True)
+        if not ok:
+            print(f"{name}: chain broken, nothing uploaded for this project")
+            continue
+        sent = upload(d, f"{LEDGER_COMMIT} record through {date.today().isoformat()}") if upload_now else False
+        print(f"{name}: {n} new rows · {rws} total · {'uploaded' if sent else 'no upload needed'}")
+    report(last)
+    if upload_now:
+        upload(HERE, f"{LEDGER_COMMIT} {last} monthly report")
+
+
+def report(month):
+    title = datetime.strptime(month, "%Y-%m").strftime("%B %Y")
+    total, sections, overall = Counter(), [], []
+    for name, path in project_ledgers():
+        rs = [r for r in rows(path) if r[0].startswith(month)]
+        if name == CENTRAL:          # its pre-2026-10-08 combined rows are counted once, in each project's own ledger
+            rs = [r for r in rs if r[2] in (None, CENTRAL, "Priority Nexus LLC")]
+        ok, n = verify(path, quiet=True)
+        overall.append((name, len(rs), ok))
+        c = Counter(r[1] for r in rs)
+        total.update(c)
+        if not rs:
+            continue
+        lines = [f"### {name}", "", " · ".join(f"{a} {c[a]}" for a in ACTIONS if c[a]) + f" · chain {'intact' if ok else 'BROKEN'}", ""]
+        for kind in ("Corrected", "Deleted", "Published"):
+            for r in [r for r in rs if r[1] == kind]:
+                lines.append(f"- **{kind}** {r[0]}: {r[3]}" + (f" ({r[5]})" if r[5] and r[5] != "commit" else ""))
+        sections.append("\n".join(lines))
+    if month == date.today().strftime("%Y-%m"):
+        title += " (month in progress; the final report is published on the 1st)"
+    L = [f"# Monthly report: {title}", "",
+         f"All Priority Nexus projects, from each project's own ledger. **{sum(total.values())} entries** across "
+         f"**{sum(1 for _, k, _ in overall if k)} projects** · every chain intact: "
+         f"**{'yes' if all(ok for _, _, ok in overall) else 'NO'}**", "",
          "| " + " | ".join(ACTIONS) + " |", "|" + "---|" * len(ACTIONS),
-         "| " + " | ".join(str(by_action.get(a, 0)) for a in ACTIONS) + " |", ""]
-    for kind, title in (("Corrected", "Corrections: our mistakes, fixed in the open"), ("Deleted", "Deletions")):
-        items = [r for r in rs if r[1] == kind]
-        L += [f"## {title} ({len(items)})", ""] + ([f"- {r[0]} · {r[2]} · {r[3]}" + (f" ({r[5]})" if r[5] else "")
-                                                   for r in items] or ["- none"]) + [""]
-    L += ["## By project", "", "| Project | Entries |", "|---|---|"] + [f"| {p} | {n} |" for p, n in by_project.most_common()]
-    os.makedirs(STATS, exist_ok=True)
-    path = os.path.join(STATS, f"{month}.md")
-    open(path, "w", encoding="utf-8", newline="\n").write("\n".join(L) + "\n")
-    print(f"stats: {path}")
+         "| " + " | ".join(str(total.get(a, 0)) for a in ACTIONS) + " |", "",
+         "Corrections, deletions and publications are listed by name: we own our mistakes. Routine edits are counted only.", "",
+         "## By project", ""] + (sections or ["No activity this month."]) + ["",
+         "## Ledger check", "", "| Project | Entries this month | Chain |", "|---|---|---|"] + \
+        [f"| [{n}](https://github.com/{OWNER}/{n}/blob/main/LEDGER.md) | {k} | {'intact' if ok else 'BROKEN'} |" for n, k, ok in overall]
+    os.makedirs(os.path.join(HERE, "STATS"), exist_ok=True)
+    p = os.path.join(HERE, "STATS", f"{month}.md")
+    open(p, "w", encoding="utf-8", newline="\n").write("\n".join(L) + "\n")
+    print(f"report: {p}")
 
 
 def main():
     ap = argparse.ArgumentParser(description="Priority Nexus Transparency Ledger")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    v = sub.add_parser("verify")
+    v.add_argument("ledgers", nargs="+")
     a = sub.add_parser("add")
+    a.add_argument("ledger")
     a.add_argument("action", choices=ACTIONS)
     a.add_argument("what")
-    a.add_argument("--project", default="Priority Nexus LLC")
     a.add_argument("--file")
     a.add_argument("--note", default="")
     a.add_argument("--date", default=date.today().isoformat())
-    sub.add_parser("sync-git")
-    r = sub.add_parser("sync-reports")
-    r.add_argument("folder")
-    sub.add_parser("verify")
-    s = sub.add_parser("stats")
-    s.add_argument("month", nargs="?", default=date.today().strftime("%Y-%m"))
+    m = sub.add_parser("monthly")
+    m.add_argument("--no-upload", action="store_true")
+    r = sub.add_parser("report")
+    r.add_argument("month", nargs="?", default=date.today().strftime("%Y-%m"))
     x = ap.parse_args()
+    if x.cmd == "verify":
+        return 0 if all(verify(p)[0] for p in x.ledgers) else 1
     if x.cmd == "add":
         fp = fingerprint_file(x.file) if x.file else hashlib.sha256(x.what.encode("utf-8")).hexdigest()[:12]
-        print("added, chain", append(x.date, x.action, x.project, x.what, fp, x.note))
-    elif x.cmd == "sync-git":
-        sync_git()
-    elif x.cmd == "sync-reports":
-        sync_reports(x.folder)
-    elif x.cmd == "verify":
-        return verify()
+        project = os.path.basename(os.path.dirname(os.path.abspath(x.ledger)))
+        print("added, chain", append(x.ledger, project, x.date, x.action, x.what, fp, x.note))
+    elif x.cmd == "monthly":
+        monthly(upload_now=not x.no_upload)
     else:
-        stats(x.month)
+        report(x.month)
     return 0
 
 
