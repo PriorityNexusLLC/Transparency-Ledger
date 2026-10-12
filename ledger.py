@@ -37,6 +37,23 @@ WORK = os.path.join(os.path.dirname(HERE), "PriorityNexus-repos")   # local copi
 REPORTS_DIR = os.path.join(os.path.expanduser("~"), "PriorityNexus", "data", "reports")
 GIT = r"C:\Program Files\Git\cmd\git.exe" if os.name == "nt" else "git"
 ACTIONS = ["Added", "Edited", "Corrected", "Reviewed", "Deleted", "Published"]
+# Public proof for PNMaster-Graph's private audit log (Josie's decision, 2026-10-12): the daily fingerprints it already
+# records locally are published once a month, in that month's report. Only fingerprints, never data.
+AUDIT_ANCHORS = os.environ.get("PN_AUDIT_ANCHORS") or os.path.join(
+    os.path.expanduser("~"), "Documents", "Obsidian Vault", "HOOT", "Reports", "Audit anchors.md")
+_ANCHOR_ROW = re.compile(r"^\|\s*(\d{4}-\d{2}-\d{2})T\S*\s*\|\s*(\d+)\s*\|\s*`?([0-9a-f]{64})`?\s*\|\s*`?([0-9a-f]{64})?`?\s*\|")
+
+
+def audit_anchors(month):
+    """The last audit fingerprint of each day in `month` (YYYY-MM): [(day, log line, log fp, map fp)]."""
+    if not os.path.exists(AUDIT_ANCHORS):
+        return None
+    last = {}
+    for line in open(AUDIT_ANCHORS, encoding="utf-8"):
+        m = _ANCHOR_ROW.match(line)
+        if m and m.group(1).startswith(month):
+            last[m.group(1)] = (m.group(1), m.group(2), m.group(3), m.group(4) or "")
+    return [last[d] for d in sorted(last)]
 LEDGER_COMMIT = "Ledger:"                                   # the ledger's own uploads are never recorded as work
 ROW = re.compile(r"^\| (\d{4}-\d{2}-\d{2}) \| (\w+) \| (?:(.*?) \| )?(.*?) \| (.*?) \| (.*?) \| ([0-9a-f]{16}) \|$")
 
@@ -258,6 +275,19 @@ def report(month):
          "## By project", ""] + (sections or ["No activity this month."]) + ["",
          "## Ledger check", "", "| Project | Entries this month | Chain |", "|---|---|---|"] + \
         [f"| [{n}](https://github.com/{OWNER}/{n}/blob/main/LEDGER.md) | {k} | {'intact' if ok else 'BROKEN'} |" for n, k, ok in overall]
+    anchors = audit_anchors(month)
+    L += ["", "## Audit fingerprints (public proof)", "",
+          "PNMaster-Graph logs every change to its map in a private audit log, each entry chained to the one before it. "
+          "Below is that log's fingerprint (SHA-256) at the end of each day this month, and the map file's. "
+          "**Only fingerprints are published; nothing about the data can be read from them.** If anyone ever doubts "
+          "the records, the log can be checked against the fingerprint for any day here: a rewritten log would no "
+          "longer match. This repository refuses rewrites of its history, so these rows can't change either.", ""]
+    if anchors:
+        L += ["| Day | Log line | Log fingerprint | Map file fingerprint |", "|---|---|---|---|"] + \
+            [f"| {d} | {n} | `{fp}` | `{gfp}` |" for d, n, fp, gfp in anchors]
+    else:
+        L.append("No fingerprints recorded for this month." if anchors == [] else
+                 "The audit-anchor file wasn't found on this computer; nothing to publish this month.")
     os.makedirs(os.path.join(HERE, "STATS"), exist_ok=True)
     p = os.path.join(HERE, "STATS", f"{month}.md")
     open(p, "w", encoding="utf-8", newline="\n").write("\n".join(L) + "\n")
